@@ -13,7 +13,7 @@ export BLUE='\033[0;34m'
 export NC='\033[0m'
 
 SCRIPT_PATH=$(readlink -f "$0")
-GITHUB_URL="https://raw.githubusercontent.com/sockc/vps-lxc/main/pro.sh"
+GITHUB_URL="https://raw.githubusercontent.com/sockc/vps-lxc/main/lxc.sh"
 
 # --- 1. 自动设置快捷入口 ---
 init_shortcut() {
