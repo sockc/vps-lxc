@@ -573,21 +573,70 @@ update_script() {
   pause
   exec bash "$dest"
 }
+net_exists() {
+  lxc network show "$1" >/dev/null 2>&1
+}
+
+detect_lxd_bridge_net() {
+  local n=""
+
+  # 1) 常见名字优先
+  for n in lxdbr0 lxdbr1 lxdbr2; do
+    net_exists "$n" && { echo "$n"; return 0; }
+  done
+
+  # 2) 从 default profile 里找 NIC 的 parent/network
+  n="$(lxc profile show default 2>/dev/null | awk '
+    $1=="network:"{print $2; exit}
+    $1=="parent:"{print $2; exit}
+  ')"
+  [[ -n "$n" ]] && net_exists "$n" && { echo "$n"; return 0; }
+
+  # 3) 从 network list 里找第一个 managed bridge
+  n="$(lxc network list -c n,t,m --format csv 2>/dev/null | awk -F',' '
+    ($2=="bridge") && (tolower($3)=="yes") {print $1; exit}
+  ')"
+  [[ -n "$n" ]] && net_exists "$n" && { echo "$n"; return 0; }
+
+  return 1
+}
 
 # ---- IPv6 menu (占位：避免菜单无反应) ----
 ipv6_menu() {
   ensure_lxc || return
 
-  local addr nat fw
-  addr="$(lxc network get lxdbr0 ipv6.address 2>/dev/null || echo "")"
-  nat="$(lxc network get lxdbr0 ipv6.nat 2>/dev/null || echo "")"
-  fw="$(lxc network get lxdbr0 ipv6.firewall 2>/dev/null || echo "")"
+  local net="${LXD_BR_NET:-}"
+  if [[ -z "$net" ]]; then
+    net="$(detect_lxd_bridge_net 2>/dev/null || true)"
+  fi
 
-  echo -e "${BLUE}IPv6 管理 (lxdbr0)${NC}"
-  echo -e "当前：ipv6.address=${YELLOW}${addr:-<unset>} ${NC}  ipv6.nat=${YELLOW}${nat:-<unset>} ${NC}  ipv6.firewall=${YELLOW}${fw:-<unset>} ${NC}"
+  if [[ -z "$net" || ! net_exists "$net" ]]; then
+    err "未找到可用的 LXD bridge 网络（所以才会 Network not found）"
+    echo -e "${YELLOW}当前网络列表：${NC}"
+    lxc network list || true
+    echo
+    read -r -p "请输入要管理的网络名（例如 lxdbr0 / lxdbr1 / 你列表里的名字）: " net < /dev/tty
+    net="$(sanitize_input "${net:-}")"
+    if [[ -z "$net" || ! net_exists "$net" ]]; then
+      err "网络名无效或不存在：$net"
+      pause
+      return
+    fi
+  fi
+
+  # 记住本次选择（全局变量）
+  LXD_BR_NET="$net"
+
+  local addr nat fw
+  addr="$(lxc network get "$net" ipv6.address 2>/dev/null || echo "<unset>")"
+  nat="$(lxc network get "$net" ipv6.nat 2>/dev/null || echo "<unset>")"
+  fw="$(lxc network get "$net" ipv6.firewall 2>/dev/null || echo "<unset>")"
+
+  echo -e "${BLUE}IPv6 管理 (${net})${NC}"
+  echo -e "当前：ipv6.address=${YELLOW}${addr}${NC}   ipv6.nat=${YELLOW}${nat}${NC}   ipv6.firewall=${YELLOW}${fw}${NC}"
   echo "------------------------------------"
   echo "1) ✅ 开启：仅容器 IPv6 出站 (ULA + NAT66)"
-  echo "2) ❌ 关闭：禁用 lxdbr0 IPv6"
+  echo "2) ❌ 关闭：禁用该网络 IPv6"
   echo "3) 🔎 测试某个容器 IPv6 连通"
   echo "0) 返回"
   read -r -p "请选择: " op < /dev/tty
@@ -595,22 +644,29 @@ ipv6_menu() {
 
   case "$op" in
     1)
-      # 宿主机没有 IPv6 出口时，NAT66 没意义，提前提醒
       if ! ip -6 route show default | grep -q .; then
-        echo -e "${YELLOW}⚠️  检测不到宿主机 IPv6 默认路由（ip -6 route default 为空）${NC}"
-        echo -e "${YELLOW}   开了 NAT66 容器也可能无法访问 IPv6。${NC}"
+        warn "宿主机没有 IPv6 默认路由（ip -6 route default 为空），容器 IPv6 出站可能仍不可用。"
       fi
-      lxc network set lxdbr0 ipv6.address auto
-      lxc network set lxdbr0 ipv6.nat true
-      lxc network set lxdbr0 ipv6.firewall true
-      echo -e "${GREEN}✅ 已开启：ULA + NAT66（仅容器出站 IPv6）${NC}"
+
+      if lxc network set "$net" ipv6.address auto \
+        && lxc network set "$net" ipv6.nat true \
+        && lxc network set "$net" ipv6.firewall true; then
+        ok "已开启：${net} -> ULA + NAT66（仅容器出站 IPv6）"
+      else
+        err "开启失败：请先确认该网络是否为 managed bridge，以及当前 project 是否正确"
+        echo -e "${YELLOW}建议：${NC} lxc network show $net"
+      fi
       pause
       ;;
     2)
-      lxc network set lxdbr0 ipv6.address none
-      lxc network set lxdbr0 ipv6.nat false
-      lxc network set lxdbr0 ipv6.firewall false
-      echo -e "${GREEN}✅ 已关闭：lxdbr0 IPv6${NC}"
+      if lxc network set "$net" ipv6.address none \
+        && lxc network set "$net" ipv6.nat false \
+        && lxc network set "$net" ipv6.firewall false; then
+        ok "已关闭：${net} IPv6"
+      else
+        err "关闭失败：请检查网络/权限/项目"
+        echo -e "${YELLOW}建议：${NC} lxc network show $net"
+      fi
       pause
       ;;
     3)
@@ -619,16 +675,16 @@ ipv6_menu() {
       input="$(sanitize_input "$input")"
       local target=""
       if ! target="$(resolve_target "$input")"; then
-        echo -e "${RED}❌ 编号越界或输入无效。${NC}"
+        err "编号越界或输入无效。"
         pause
         return
       fi
       echo -e "${BLUE}---- $target IPv6 信息 ----${NC}"
-      lxc exec "$target" -- sh -lc 'ip -6 addr show dev eth0; echo; ip -6 route; echo; ping -6 -c 3 2606:4700:4700::1111' || true
+      lxc_exec_tty "$target" /bin/sh -lc 'ip -6 addr show; echo; ip -6 route; echo; ping -6 -c 3 2606:4700:4700::1111' || true
       pause
       ;;
     0) return ;;
-    *) echo -e "${YELLOW}无效选项${NC}"; pause ;;
+    *) warn "无效选项"; pause ;;
   esac
 }
 # ---- Uninstall (占位：避免误伤系统) ----
