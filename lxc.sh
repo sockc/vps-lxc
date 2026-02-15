@@ -985,6 +985,7 @@ nic_tools_menu() {
     echo -e "${BLUE}====================================${NC}"
     echo "1) 给指定容器补网卡 eth0（接入 managed bridge）"
     echo "2) 修复 default profile（让新建容器默认有网卡）"
+    echo "3) 修复容器 DHCPv4/DNS（容器只有 IPv6 时）"
     echo "0) 返回"
     echo "------------------------------------"
     read -r -p "请选择: " op < /dev/tty
@@ -992,6 +993,7 @@ nic_tools_menu() {
     case "$op" in
       1) fix_container_nic_interactive ;;
       2) fix_default_profile_nic_interactive ;;
+      3) fix_container_ipv4_menu ;;
       0) return ;;
       *) warn "无效选项"; pause ;;
     esac
@@ -1540,6 +1542,170 @@ startup_sanity_check() {
   fi
 
   read -r -p "按回车继续进入菜单..." < /dev/tty
+}
+
+# =========================
+# 容器 DHCPv4 / DNS 修复模块
+# =========================
+
+# 统一的容器执行（兼容 curl|bash 非交互）
+lxc_exec_tty() {
+  local ct="$1"; shift
+  if [[ -t 0 && -t 1 ]]; then
+    lxc exec "$ct" -- "$@"
+  else
+    lxc exec "$ct" -- "$@" < /dev/tty > /dev/tty 2>&1
+  fi
+}
+
+# 检测容器 eth0 是否已有 IPv4
+ct_has_ipv4() {
+  local ct="$1"
+  lxc exec "$ct" -- /bin/sh -lc 'ip -4 addr show dev eth0 2>/dev/null | grep -q "inet "' >/dev/null 2>&1
+}
+
+# 尝试在容器内启用 DHCPv4（systemd-networkd 优先）
+ct_fix_dhcp4_inside() {
+  local ct="$1"
+
+  # 1) systemd-networkd 路线（Debian/Ubuntu 常见）
+  lxc exec "$ct" -- /bin/sh -lc '
+set -e
+if command -v systemctl >/dev/null 2>&1; then
+  # 如果有 networkd，就用 networkd 管
+  if systemctl list-unit-files 2>/dev/null | grep -q "^systemd-networkd\.service"; then
+    mkdir -p /etc/systemd/network
+
+    # 写一个明确的 eth0 DHCP4 配置（同时接受 IPv6 RA）
+    cat >/etc/systemd/network/10-eth0.network <<EOF
+[Match]
+Name=eth0
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=yes
+EOF
+
+    systemctl enable --now systemd-networkd systemd-resolved >/dev/null 2>&1 || true
+    systemctl restart systemd-networkd systemd-resolved >/dev/null 2>&1 || true
+
+    # 尝试让 eth0 立刻重配
+    if command -v networkctl >/dev/null 2>&1; then
+      networkctl reconfigure eth0 >/dev/null 2>&1 || true
+    fi
+    exit 0
+  fi
+fi
+exit 2
+' >/dev/null 2>&1 && return 0
+
+  # 2) ifupdown 路线（老 Debian 也可能）
+  lxc exec "$ct" -- /bin/sh -lc '
+set -e
+if command -v ifup >/dev/null 2>&1; then
+  # 最小化写 interfaces（你也可以改成只在文件为空时写）
+  cat >/etc/network/interfaces <<EOF
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+iface eth0 inet6 auto
+EOF
+  (ifdown eth0 >/dev/null 2>&1 || true)
+  (ifup eth0 >/dev/null 2>&1 || true)
+  exit 0
+fi
+exit 2
+' >/dev/null 2>&1 && return 0
+
+  return 1
+}
+
+# 如果 systemd-resolved stub 没拿到上游 DNS，就强行给它塞 DNS（不改 resolv.conf 的 stub）
+ct_fix_resolved_dns_if_needed() {
+  local ct="$1"
+  lxc exec "$ct" -- /bin/sh -lc '
+set -e
+# 如果是 resolved stub
+if [ -e /etc/resolv.conf ] && grep -q "127.0.0.53" /etc/resolv.conf 2>/dev/null; then
+  # 看看 resolved 是否有 uplink DNS
+  if command -v resolvectl >/dev/null 2>&1; then
+    if ! resolvectl status 2>/dev/null | grep -qE "DNS Servers:\s*([0-9]+\.[0-9]+\.|[0-9a-fA-F:]+)"; then
+      # 用默认网关当 DNS（lxdbr0 通常就是网关），再加公共 DNS 兜底
+      gw4="$(ip -4 route show default 2>/dev/null | awk "{print \$3; exit}")"
+      if [ -n "$gw4" ]; then
+        resolvectl dns eth0 "$gw4" 1.1.1.1 8.8.8.8 >/dev/null 2>&1 || true
+      else
+        resolvectl dns eth0 1.1.1.1 8.8.8.8 >/dev/null 2>&1 || true
+      fi
+      resolvectl flush-caches >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+' >/dev/null 2>&1 || true
+}
+
+# 主入口：修复指定容器的 IPv4 DHCP + DNS（必要时重启网络服务）
+fix_container_ipv4_dhcp() {
+  local ct="$1"
+
+  # 已有 IPv4 就不折腾
+  if ct_has_ipv4 "$ct"; then
+    ok "$ct 已有 IPv4，无需修复"
+    return 0
+  fi
+
+  info "开始修复容器 $ct：启用 DHCPv4（eth0）..."
+  if ! ct_fix_dhcp4_inside "$ct"; then
+    warn "容器内未识别到 systemd-networkd/ifupdown，可能是特殊镜像（如 Alpine）。"
+  fi
+
+  # 等待一下 DHCP
+  sleep 2
+
+  # 再检查一次
+  if ct_has_ipv4 "$ct"; then
+    ok "$ct 已获取 IPv4 ✅"
+    ct_fix_resolved_dns_if_needed "$ct"
+    return 0
+  fi
+
+  # 仍然失败：输出诊断信息
+  err "$ct 仍未获取 IPv4（DHCPv4 可能没跑起来）"
+  echo -e "${YELLOW}建议在宿主机执行：${NC} lxc network list-leases lxdbr0"
+  echo -e "${YELLOW}容器内查看：${NC} ip -4 a; networkctl status eth0; resolvectl status"
+  return 1
+}
+
+# 菜单动作：选择容器 ->（可选）补网卡 -> 修 DHCPv4
+fix_container_ipv4_menu() {
+  ensure_lxc || return
+
+  list_containers || { pause; return; }
+  read -r -p "选择容器(名字或编号): " input < /dev/tty
+  input="$(sanitize_input "$input")"
+  local ct=""
+  if ! ct="$(resolve_target "$input")"; then
+    err "输入无效"
+    pause
+    return
+  fi
+
+  # 如果容器完全没设备，先提示补网卡（你已有补网卡逻辑，这里只做提醒）
+  if lxc config device show "$ct" 2>/dev/null | grep -qE '^\{\s*\}$'; then
+    warn "$ct 当前没有任何设备（devices: {}），请先用【补网卡 eth0】接入 lxdbr0/lxdbr1"
+    pause
+    return
+  fi
+
+  # 修复 DHCPv4
+  fix_container_ipv4_dhcp "$ct" || true
+
+  # 展示结果
+  echo -e "${BLUE}---- $ct 网络结果 ----${NC}"
+  lxc_exec_tty "$ct" /bin/sh -lc 'ip a; echo; ip r | head; echo; cat /etc/resolv.conf | head -n 8' || true
+  pause
 }
 
 # ---- Main menu ----
