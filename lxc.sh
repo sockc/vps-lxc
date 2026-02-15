@@ -12,6 +12,8 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+command -v lxc_exec_tty >/dev/null 2>&1 || true
+
 # ---- Safe shell options (不使用 set -e，避免交互脚本因非关键失败直接退出) ----
 set -u
 set -o pipefail
@@ -805,7 +807,7 @@ ipv6_menu() {
         return
       fi
       echo -e "${BLUE}---- $target IPv6 信息 ----${NC}"
-      lxc_exec_tty "$target" /bin/sh -lc 'ip -6 addr show; echo; ip -6 route; echo; ping -6 -c 3 2606:4700:4700::1111' || true
+      lxc exec "$target" -- /bin/sh -lc 'ip -6 addr show; echo; ip -6 route; echo; ping -6 -c 3 2606:4700:4700::1111' < /dev/tty > /dev/tty 2>&1 || true
       pause
       ;;
     0) return ;;
