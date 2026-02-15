@@ -601,7 +601,7 @@ detect_lxd_bridge_net() {
   return 1
 }
 
-# ---- IPv6 menu (占位：避免菜单无反应) ----
+# ---- IPv6 menu ----
 ipv6_menu() {
   ensure_lxc || return
 
@@ -687,6 +687,199 @@ ipv6_menu() {
     *) warn "无效选项"; pause ;;
   esac
 }
+detect_lxd_install_method() {
+  # echo: snap | apt | unknown
+  if command -v snap >/dev/null 2>&1 && snap list 2>/dev/null | awk '{print $1}' | grep -qx lxd; then
+    echo "snap"; return 0
+  fi
+  if command -v dpkg-query >/dev/null 2>&1; then
+    dpkg-query -W -f='${Status}' lxd 2>/dev/null | grep -q "installed" && { echo "apt"; return 0; }
+  fi
+  if command -v rpm >/dev/null 2>&1 && rpm -q lxd >/dev/null 2>&1; then
+    echo "rpm"; return 0
+  fi
+  if command -v apk >/dev/null 2>&1 && apk info -e lxd >/dev/null 2>&1; then
+    echo "apk"; return 0
+  fi
+  if command -v pacman >/dev/null 2>&1 && pacman -Q lxd >/dev/null 2>&1; then
+    echo "pacman"; return 0
+  fi
+  echo "unknown"
+}
+
+lxd_data_dirs_for_method() {
+  # 输出一行或多行：需要清理的数据目录
+  local m="$1"
+  case "$m" in
+    snap)
+      echo "/var/snap/lxd"
+      echo "/var/snap/lxd/common/lxd"
+      ;;
+    apt|rpm|apk|pacman)
+      echo "/var/lib/lxd"
+      echo "/var/cache/lxd"
+      echo "/var/log/lxd"
+      echo "/etc/lxd"
+      ;;
+    *)
+      # 尽力列举常见路径
+      echo "/var/snap/lxd"
+      echo "/var/lib/lxd"
+      echo "/etc/lxd"
+      ;;
+  esac
+}
+
+cleanup_lxd_bridges() {
+  # 删除残留的 lxdbr* 网桥（不会动你自定义 br0 之类）
+  command -v ip >/dev/null 2>&1 || return 0
+  local br
+  for br in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^lxdbr[0-9]+$' || true); do
+    ip link set "$br" down >/dev/null 2>&1 || true
+    ip link delete "$br" >/dev/null 2>&1 || true
+  done
+}
+
+export_all_instances() {
+  # 导出所有容器到指定目录（tarball）
+  local outdir="$1"
+  command -v lxc >/dev/null 2>&1 || { err "找不到 lxc 命令，无法导出。"; return 1; }
+
+  mkdir -p "$outdir" || return 1
+
+  local names=()
+  mapfile -t names < <(lxc list -c n --format csv 2>/dev/null | tr -d '\r' | sed '/^$/d')
+  if [[ ${#names[@]} -eq 0 ]]; then
+    warn "没有容器可导出。"
+    return 0
+  fi
+
+  info "开始导出 ${#names[@]} 个容器到：$outdir"
+  local n okc=0 failc=0
+  for n in "${names[@]}"; do
+    info "导出: $n -> $outdir/${n}.tar.gz"
+    if lxc export "$n" "$outdir/${n}.tar.gz" >/dev/null 2>&1; then
+      okc=$((okc+1))
+    else
+      failc=$((failc+1))
+      warn "导出失败：$n（你可手动：lxc export $n ...）"
+    fi
+  done
+  ok "导出完成：成功 $okc / 失败 $failc"
+  return 0
+}
+
+uninstall_env() {
+  # 不强依赖 ensure_lxc：即便 lxc 不可用也能卸载
+  need_root
+
+  local method
+  method="$(detect_lxd_install_method)"
+
+  echo -e "${RED}⚠️  彻底卸载 LXD/LXC 环境（高危）${NC}"
+  echo -e "${YELLOW}将执行：停止服务 -> (可选导出容器) -> 删除所有实例/镜像/网络/存储数据 -> 卸载软件包 -> 清理数据目录${NC}"
+  echo
+
+  echo -e "${BLUE}检测到安装方式：${NC} ${YELLOW}${method}${NC}"
+  echo -e "${BLUE}可能的数据目录：${NC}"
+  lxd_data_dirs_for_method "$method" | sed 's/^/  - /'
+  echo
+
+  # 统计信息（能取到就展示）
+  if command -v lxc >/dev/null 2>&1; then
+    local icount
+    icount="$(lxc list -c n --format csv 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')"
+    echo -e "${BLUE}检测到实例数量：${NC} ${YELLOW}${icount}${NC}"
+  fi
+  echo
+
+  # 1) 备份导出（可选）
+  read -r -p "是否先导出全部容器备份？(y/N): " b < /dev/tty
+  b="$(sanitize_input "${b:-}")"
+  if [[ "$b" == "y" || "$b" == "Y" ]]; then
+    local out="/root/lxd-exports-$(date +%Y%m%d-%H%M%S)"
+    read -r -p "导出目录 (默认: $out): " out_in < /dev/tty
+    out_in="$(sanitize_input "${out_in:-}")"
+    [[ -n "$out_in" ]] && out="$out_in"
+    export_all_instances "$out" || warn "导出步骤出现问题，但你仍可继续卸载。"
+    echo
+  fi
+
+  # 2) 最终强确认
+  echo -e "${RED}最后确认：这会删除所有 LXD 数据，且不可恢复。${NC}"
+  echo -e "${YELLOW}请输入：UNINSTALL-LXD 继续；输入其它任何内容取消。${NC}"
+  read -r -p "确认输入: " confirm < /dev/tty
+  confirm="$(sanitize_input "${confirm:-}")"
+  if [[ "$confirm" != "UNINSTALL-LXD" ]]; then
+    warn "已取消卸载。"
+    pause
+    return
+  fi
+
+  # 3) 停服务 + 尽力删除实例（如果 lxc 可用）
+  if command -v lxc >/dev/null 2>&1; then
+    info "尝试删除所有实例（容器/虚拟机）..."
+    # 停止全部实例
+    lxc list -c n --format csv 2>/dev/null | tr -d '\r' | sed '/^$/d' | while read -r n; do
+      lxc stop "$n" --force >/dev/null 2>&1 || true
+    done
+    # 删除全部实例
+    lxc list -c n --format csv 2>/dev/null | tr -d '\r' | sed '/^$/d' | while read -r n; do
+      lxc delete "$n" --force >/dev/null 2>&1 || true
+    done
+  fi
+
+  # 4) 卸载软件
+  case "$method" in
+    snap)
+      info "停止并卸载 snap lxd..."
+      snap stop lxd >/dev/null 2>&1 || true
+      snap remove --purge lxd >/dev/null 2>&1 || true
+      ;;
+    apt)
+      info "停止并卸载 apt lxd..."
+      systemctl stop lxd lxd.socket >/dev/null 2>&1 || true
+      # lxd/lxc 相关：按“彻底”思路，lxc 与 lxcfs 一并卸载
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y lxd lxd-client lxc lxcfs >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
+      ;;
+    rpm)
+      info "停止并卸载 rpm lxd..."
+      systemctl stop lxd lxd.socket >/dev/null 2>&1 || true
+      yum remove -y lxd lxc lxcfs >/dev/null 2>&1 || dnf remove -y lxd lxc lxcfs >/dev/null 2>&1 || true
+      ;;
+    apk)
+      info "卸载 apk lxd..."
+      rc-service lxd stop >/dev/null 2>&1 || true
+      apk del lxd lxc lxcfs >/dev/null 2>&1 || true
+      ;;
+    pacman)
+      info "卸载 pacman lxd..."
+      systemctl stop lxd lxd.socket >/dev/null 2>&1 || true
+      pacman -Rns --noconfirm lxd lxc lxcfs >/dev/null 2>&1 || true
+      ;;
+    *)
+      warn "未识别安装方式，将只做目录清理与网桥清理（你可手动卸载软件包）。"
+      ;;
+  esac
+
+  # 5) 清理数据目录
+  info "清理数据目录..."
+  local d
+  while read -r d; do
+    [[ -z "$d" ]] && continue
+    if [[ -e "$d" ]]; then
+      rm -rf "$d" >/dev/null 2>&1 || true
+    fi
+  done < <(lxd_data_dirs_for_method "$method")
+
+  # 6) 清理残留网桥
+  info "清理残留 lxdbr* 网桥..."
+  cleanup_lxd_bridges
+
+  ok "卸载流程已执行完成。建议重启一次系统以清理残留（可选）。"
+  pause
+}
 # ---- Uninstall (占位：避免误伤系统) ----
 uninstall_env() {
   warn "彻底卸载环境属于高危操作（不同发行版安装方式不同：snap lxd / apt lxd / 自编译）。"
@@ -708,12 +901,12 @@ main_menu() {
     echo -e "1. 🏗️  创建新容器"
     echo -e "2. 📸  快照备份 / 一键回滚"
     echo -e "3. 🚪  ${GREEN}进入指定容器 (稳健驻留版)${NC}"
-    echo -e "4. 🌐  IPv6 独立管理 (开关)  ${YELLOW}(占位可定制)${NC}"
+    echo -e "4. 🌐  IPv6 独立管理 (开关)  ${YELLOW}"
     echo -e "5. 📋  容器列表 & 状态查看"
     echo -e "6. ⚙️  资源限制修改"
     echo -e "7. 🗑️  销毁指定容器"
     echo -e "8. 🔄  从 GitHub 更新脚本"
-    echo -e "9. ❌  彻底卸载环境  ${YELLOW}(占位可定制)${NC}"
+    echo -e "9. ❌  彻底卸载环境  ${YELLOW}"
     echo -e "0. 退出脚本"
     echo -e "${BLUE}------------------------------------${NC}"
 
