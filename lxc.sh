@@ -610,21 +610,20 @@ ipv6_menu() {
     net="$(detect_lxd_bridge_net 2>/dev/null || true)"
   fi
 
-  if [[ -z "$net" || ! net_exists "$net" ]]; then
+  if [[ -z "$net" ]] || ! net_exists "$net"; then
     err "未找到可用的 LXD bridge 网络（所以才会 Network not found）"
     echo -e "${YELLOW}当前网络列表：${NC}"
     lxc network list || true
     echo
     read -r -p "请输入要管理的网络名（例如 lxdbr0 / lxdbr1 / 你列表里的名字）: " net < /dev/tty
     net="$(sanitize_input "${net:-}")"
-    if [[ -z "$net" || ! net_exists "$net" ]]; then
+    if [[ -z "$net" ]] || ! net_exists "$net"; then
       err "网络名无效或不存在：$net"
       pause
       return
     fi
   fi
 
-  # 记住本次选择（全局变量）
   LXD_BR_NET="$net"
 
   local addr nat fw
@@ -653,7 +652,7 @@ ipv6_menu() {
         && lxc network set "$net" ipv6.firewall true; then
         ok "已开启：${net} -> ULA + NAT66（仅容器出站 IPv6）"
       else
-        err "开启失败：请先确认该网络是否为 managed bridge，以及当前 project 是否正确"
+        err "开启失败：请检查 network/project/权限"
         echo -e "${YELLOW}建议：${NC} lxc network show $net"
       fi
       pause
@@ -664,7 +663,7 @@ ipv6_menu() {
         && lxc network set "$net" ipv6.firewall false; then
         ok "已关闭：${net} IPv6"
       else
-        err "关闭失败：请检查网络/权限/项目"
+        err "关闭失败：请检查 network/project/权限"
         echo -e "${YELLOW}建议：${NC} lxc network show $net"
       fi
       pause
