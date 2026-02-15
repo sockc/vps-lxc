@@ -1441,12 +1441,12 @@ main_menu() {
     echo -e "2.  📸 快照备份 / 一键回滚"
     echo -e "3.  🚪 ${GREEN}进入指定容器 ${NC}"
     echo -e "4.  🌐 IPv6 独立管理 (开关)  ${YELLOW}"
-    echo -e "5.  📋  容器列表 & 状态查看"
+    echo -e "5.  📋 容器列表 & 状态查看"
     echo -e "6.  ⚙️  资源限制修改"
     echo -e "7.  🗑️  销毁指定容器"
-    echo -e "8.  🔄 从 GitHub 更新脚本"
-    echo -e "9.  🔀 IPv4 访问（端口映射）"
-    echo -e "10. 🧩 容器网卡修复工具（eth0 / default profile）"
+    echo -e "8.  🔀 IPv4 访问（端口映射）"
+    echo -e "9.  🧩 容器网卡修复工具"
+    echo -e "10. 🔄 更新脚本"
     echo -e "11. ❌ 彻底卸载环境  ${YELLOW}"
     echo -e "0. 退出脚本"
     echo -e "${BLUE}------------------------------------${NC}"
@@ -1462,9 +1462,9 @@ main_menu() {
       5) ensure_lxc && lxc list; pause ;;
       6) resource_limits ;;
       7) delete_container ;;
-      8) update_script ;;
-      9) port_forward_menu ;;
-      10) nic_tools_menu ;;
+      8) port_forward_menu ;;
+      9) nic_tools_menu ;;
+      10) update_script ;;
       11) uninstall_env ;;
 
       0) exit 0 ;;
