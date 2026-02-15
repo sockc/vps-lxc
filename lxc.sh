@@ -17,7 +17,7 @@ set -u
 set -o pipefail
 
 # ---- Script identity / update ----
-SELF_SRC="${BASH_SOURCE[0]}"
+SELF_SRC="${BASH_SOURCE[0]-$0}"
 SCRIPT_PATH="$(readlink -f "$SELF_SRC" 2>/dev/null || realpath "$SELF_SRC" 2>/dev/null || echo "$SELF_SRC")"
 GITHUB_URL="https://raw.githubusercontent.com/sockc/vps-lxc/main/lxc.sh"
 
