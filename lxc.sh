@@ -791,6 +791,182 @@ ipv6_menu() {
   esac
 }
 # ----------------------------
+# NIC Repair Tools (LXD)
+# ----------------------------
+
+# 依赖：ensure_lxc / sanitize_input / list_containers / resolve_target / net_exists / list_managed_bridges / is_managed_bridge / info/ok/warn/err/pause
+
+pick_free_lxd_device_name() {
+  local ct="$1" base="$2" i=0 name="$base"
+  while lxc config device show "$ct" 2>/dev/null | grep -qE "^${name}:"; do
+    i=$((i+1))
+    name="${base}${i}"
+    (( i > 50 )) && { echo ""; return 1; }
+  done
+  echo "$name"
+}
+
+container_has_nic() {
+  local ct="$1"
+  # 有任何 type: nic 就算有网卡
+  lxc config device show "$ct" 2>/dev/null \
+    | awk '
+      /^[^[:space:]].*:/ {dev=$1; sub(":", "", dev); next}
+      /^[[:space:]]+type:/ { if($2=="nic") { found=1 } }
+      END { exit(found?0:1) }
+    '
+}
+
+choose_managed_bridge_interactive() {
+  local list net pick
+  list="$(list_managed_bridges 2>/dev/null || true)"
+  if [[ -z "${list:-}" ]]; then
+    err "没有可用的 MANAGED bridge（请先在 IPv6 菜单创建 lxdbr0/lxdbr1）"
+    return 1
+  fi
+  echo -e "${BLUE}可用的 MANAGED bridge 网络：${NC}"
+  echo "$list" | nl -w2 -s') '
+  read -r -p "请选择网络（输入编号或直接输入名字，默认 1）: " pick < /dev/tty
+  pick="$(sanitize_input "${pick:-}")"
+  if [[ -z "$pick" ]]; then
+    net="$(echo "$list" | sed -n '1p')"
+  elif [[ "$pick" =~ ^[0-9]+$ ]]; then
+    net="$(echo "$list" | sed -n "${pick}p")"
+  else
+    net="$pick"
+  fi
+  [[ -z "${net:-}" ]] && return 1
+  net_exists "$net" && is_managed_bridge "$net" || return 1
+  echo "$net"
+}
+
+fix_container_nic() {
+  local ct="$1" net="$2"
+
+  if ! net_exists "$net" || ! is_managed_bridge "$net"; then
+    err "网络无效或不是 MANAGED bridge：$net"
+    return 1
+  fi
+
+  # 如果已有 nic，默认不动（避免破坏现有网络）
+  if container_has_nic "$ct"; then
+    warn "容器 $ct 已有网卡（type=nic），为安全起见不自动修改。"
+    echo -e "${YELLOW}你可以手动查看：${NC} lxc config device show $ct"
+    return 0
+  fi
+
+  # 没有任何 nic：补一个 eth0
+  local dev ifname
+  ifname="eth0"
+  dev="$(pick_free_lxd_device_name "$ct" "eth0")"
+  [[ -z "$dev" ]] && { err "生成设备名失败"; return 1; }
+
+  info "给容器 $ct 添加网卡：device=$dev  ifname=$ifname  network=$net"
+  if lxc config device add "$ct" "$dev" nic network="$net" name="$ifname" >/dev/null 2>&1; then
+    ok "已添加网卡：$ct -> $dev (name=$ifname, network=$net)"
+    return 0
+  else
+    err "添加网卡失败：$ct"
+    return 1
+  fi
+}
+
+fix_container_nic_interactive() {
+  ensure_lxc || return
+
+  list_containers || { pause; return; }
+  read -r -p "选择容器(名字或编号): " input < /dev/tty
+  input="$(sanitize_input "$input")"
+  local ct=""
+  if ! ct="$(resolve_target "$input")"; then
+    err "编号越界或输入无效。"
+    pause; return
+  fi
+
+  local net
+  net="$(choose_managed_bridge_interactive)" || { err "未选择到有效 managed bridge"; pause; return; }
+
+  echo -e "${YELLOW}说明：若容器目前完全没网卡（ip a 只有 lo），此操作会补 eth0 并建议重启容器。${NC}"
+  read -r -p "确认给 $ct 补网卡并接入 $net？(y/N): " yn < /dev/tty
+  yn="$(sanitize_input "${yn:-}")"
+  [[ "$yn" != "y" && "$yn" != "Y" ]] && { warn "已取消。"; pause; return; }
+
+  if fix_container_nic "$ct" "$net"; then
+    read -r -p "是否重启容器 $ct 使网卡生效？(y/N): " rn < /dev/tty
+    rn="$(sanitize_input "${rn:-}")"
+    if [[ "$rn" == "y" || "$rn" == "Y" ]]; then
+      lxc restart "$ct" >/dev/null 2>&1 || true
+      ok "已重启：$ct"
+    fi
+    echo -e "${BLUE}快速验证：${NC} lxc exec $ct -- sh -lc 'ip a; ip -6 addr; ip -6 route'"
+  fi
+  pause
+}
+
+default_profile_has_nic() {
+  lxc profile show default 2>/dev/null \
+    | awk '
+      $1=="devices:" {in=1; next}
+      in && /^[^[:space:]]/ {in=0}
+      in && /^[[:space:]]+eth0:/ {eth=1}
+      in && /^[[:space:]]+type:/ && eth && $2=="nic" {found=1}
+      END { exit(found?0:1) }
+    '
+}
+
+fix_default_profile_nic_interactive() {
+  ensure_lxc || return
+
+  local net
+  net="$(choose_managed_bridge_interactive)" || { err "未选择到有效 managed bridge"; pause; return; }
+
+  echo -e "${YELLOW}将把 default profile 的 eth0 设为 nic network=$net（影响今后新建容器默认网络）。${NC}"
+  read -r -p "确认修改 default profile？(y/N): " yn < /dev/tty
+  yn="$(sanitize_input "${yn:-}")"
+  [[ "$yn" != "y" && "$yn" != "Y" ]] && { warn "已取消。"; pause; return; }
+
+  # 若 eth0 不存在就 add；存在则尽量 set network
+  if lxc profile device list default 2>/dev/null | grep -qx eth0; then
+    # 如果不是 nic 或不是 managed network，不强制改类型，只尝试 set network
+    lxc profile device set default eth0 network "$net" >/dev/null 2>&1 || true
+    lxc profile device set default eth0 name eth0 >/dev/null 2>&1 || true
+    ok "已尝试更新 default profile 的 eth0 -> network=$net"
+  else
+    if lxc profile device add default eth0 nic network="$net" name=eth0 >/dev/null 2>&1; then
+      ok "已添加 default profile 网卡：eth0 (network=$net)"
+    else
+      err "修改 default profile 失败"
+      echo -e "${YELLOW}建议：${NC} lxc profile show default"
+    fi
+  fi
+
+  echo -e "${BLUE}查看：${NC} lxc profile show default | sed -n '1,160p'"
+  pause
+}
+
+nic_tools_menu() {
+  ensure_lxc || return
+  while true; do
+    clear
+    echo -e "${BLUE}====================================${NC}"
+    echo -e "${GREEN}        容器网卡修复工具 (LXD)       ${NC}"
+    echo -e "${BLUE}====================================${NC}"
+    echo "1) 给指定容器补网卡 eth0（接入 managed bridge）"
+    echo "2) 修复 default profile（让新建容器默认有网卡）"
+    echo "0) 返回"
+    echo "------------------------------------"
+    read -r -p "请选择: " op < /dev/tty
+    op="$(sanitize_input "${op:-}")"
+    case "$op" in
+      1) fix_container_nic_interactive ;;
+      2) fix_default_profile_nic_interactive ;;
+      0) return ;;
+      *) warn "无效选项"; pause ;;
+    esac
+  done
+}
+
+# ----------------------------
 # IPv4 Port Forward (LXD proxy)
 # ----------------------------
 
@@ -1248,7 +1424,8 @@ main_menu() {
     echo -e "7. 🗑️  销毁指定容器"
     echo -e "8. 🔄  从 GitHub 更新脚本"
     echo -e "9. 🔀  外部 IPv4 访问容器（端口映射）"
-    echo -e "10. ❌  彻底卸载环境  ${YELLOW}"
+    echo -e "10. 🧩  容器网卡修复工具（eth0 / default profile）"
+    echo -e "11. ❌  彻底卸载环境  ${YELLOW}"
     echo -e "0. 退出脚本"
     echo -e "${BLUE}------------------------------------${NC}"
 
@@ -1265,7 +1442,8 @@ main_menu() {
       7) delete_container ;;
       8) update_script ;;
       9) port_forward_menu ;;
-      10) uninstall_env ;;
+      10) nic_tools_menu ;;
+      11) uninstall_env ;;
 
       0) exit 0 ;;
       *) warn "无效选项：$opt"; pause ;;
