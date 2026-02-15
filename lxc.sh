@@ -1235,8 +1235,8 @@ main_menu() {
     echo -e "6. ⚙️  资源限制修改"
     echo -e "7. 🗑️  销毁指定容器"
     echo -e "8. 🔄  从 GitHub 更新脚本"
-    echo -e "9. ❌  彻底卸载环境  ${YELLOW}"
-    echo -e "10. 🔀  外部 IPv4 访问容器（端口映射）"
+    echo -e "9. 🔀  外部 IPv4 访问容器（端口映射）"
+    echo -e "10. ❌  彻底卸载环境  ${YELLOW}"
     echo -e "0. 退出脚本"
     echo -e "${BLUE}------------------------------------${NC}"
 
@@ -1252,8 +1252,9 @@ main_menu() {
       6) resource_limits ;;
       7) delete_container ;;
       8) update_script ;;
-      9) uninstall_env ;;
-      10) port_forward_menu ;;
+      9) port_forward_menu ;;
+      10) uninstall_env ;;
+
       0) exit 0 ;;
       *) warn "无效选项：$opt"; pause ;;
     esac
