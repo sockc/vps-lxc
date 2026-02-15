@@ -392,14 +392,61 @@ update_script() {
 
 # ---- IPv6 menu (占位：避免菜单无反应) ----
 ipv6_menu() {
-  warn "IPv6 独立管理：不同环境(LXD bridge/物理网卡/云厂商)差异很大，建议按你的网络结构定制。"
-  echo -e "${YELLOW}如果你告诉我：${NC}"
-  echo "  1) 你的 LXD 网络是 lxdbr0 还是物理网卡桥接？"
-  echo "  2) 你想开的是宿主 IPv6、容器 IPv6、还是 NAT66？"
-  echo "我可以给你做成可一键开关且可回滚的版本。"
-  pause
-}
+  ensure_lxc || return
 
+  local addr nat fw
+  addr="$(lxc network get lxdbr0 ipv6.address 2>/dev/null || echo "")"
+  nat="$(lxc network get lxdbr0 ipv6.nat 2>/dev/null || echo "")"
+  fw="$(lxc network get lxdbr0 ipv6.firewall 2>/dev/null || echo "")"
+
+  echo -e "${BLUE}IPv6 管理 (lxdbr0)${NC}"
+  echo -e "当前：ipv6.address=${YELLOW}${addr:-<unset>} ${NC}  ipv6.nat=${YELLOW}${nat:-<unset>} ${NC}  ipv6.firewall=${YELLOW}${fw:-<unset>} ${NC}"
+  echo "------------------------------------"
+  echo "1) ✅ 开启：仅容器 IPv6 出站 (ULA + NAT66)"
+  echo "2) ❌ 关闭：禁用 lxdbr0 IPv6"
+  echo "3) 🔎 测试某个容器 IPv6 连通"
+  echo "0) 返回"
+  read -r -p "请选择: " op < /dev/tty
+  op="$(sanitize_input "${op:-}")"
+
+  case "$op" in
+    1)
+      # 宿主机没有 IPv6 出口时，NAT66 没意义，提前提醒
+      if ! ip -6 route show default | grep -q .; then
+        echo -e "${YELLOW}⚠️  检测不到宿主机 IPv6 默认路由（ip -6 route default 为空）${NC}"
+        echo -e "${YELLOW}   开了 NAT66 容器也可能无法访问 IPv6。${NC}"
+      fi
+      lxc network set lxdbr0 ipv6.address auto
+      lxc network set lxdbr0 ipv6.nat true
+      lxc network set lxdbr0 ipv6.firewall true
+      echo -e "${GREEN}✅ 已开启：ULA + NAT66（仅容器出站 IPv6）${NC}"
+      pause
+      ;;
+    2)
+      lxc network set lxdbr0 ipv6.address none
+      lxc network set lxdbr0 ipv6.nat false
+      lxc network set lxdbr0 ipv6.firewall false
+      echo -e "${GREEN}✅ 已关闭：lxdbr0 IPv6${NC}"
+      pause
+      ;;
+    3)
+      list_containers || { pause; return; }
+      read -r -p "选择容器(名字或编号): " input < /dev/tty
+      input="$(sanitize_input "$input")"
+      local target=""
+      if ! target="$(resolve_target "$input")"; then
+        echo -e "${RED}❌ 编号越界或输入无效。${NC}"
+        pause
+        return
+      fi
+      echo -e "${BLUE}---- $target IPv6 信息 ----${NC}"
+      lxc exec "$target" -- sh -lc 'ip -6 addr show dev eth0; echo; ip -6 route; echo; ping -6 -c 3 2606:4700:4700::1111' || true
+      pause
+      ;;
+    0) return ;;
+    *) echo -e "${YELLOW}无效选项${NC}"; pause ;;
+  esac
+}
 # ---- Uninstall (占位：避免误伤系统) ----
 uninstall_env() {
   warn "彻底卸载环境属于高危操作（不同发行版安装方式不同：snap lxd / apt lxd / 自编译）。"
