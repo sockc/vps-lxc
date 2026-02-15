@@ -201,9 +201,6 @@ enter_container() {
 if ! lxc_exec_tty "$target" /bin/bash -li; then
   echo -e "${YELLOW}⚠️  /bin/bash 不可用，尝试 /bin/sh 进入...${NC}"
   if ! lxc_exec_tty "$target" /bin/sh -l; then
-    ...
-  fi
-fi
       err "------------------------------------"
       err "致命错误: 无法进入容器 '$target'"
       echo -e "${YELLOW}可能原因:${NC}"
