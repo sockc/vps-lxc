@@ -619,19 +619,41 @@ is_managed_bridge() {
     '
 }
 
+# 列出所有 managed bridge（兼容 YES/NO、true/false、1/0、以及 CSV 引号/表头）
 list_managed_bridges() {
-  lxc network list -c n,t,m --format csv 2>/dev/null \
+  lxc network list --format csv 2>/dev/null \
     | tr -d '\r' \
     | awk -F',' '
       {
-        t=tolower($2); m=tolower($3);
-        gsub(/[[:space:]]+/, "", t); gsub(/[[:space:]]+/, "", m);
-        if (t=="bridge" && (m=="yes" || m=="true" || m=="1")) print $1
+        raw_n=$1; raw_t=$2; raw_m=$3;
+
+        # 清洗：去引号+空白
+        n=raw_n; t=raw_t; m=raw_m;
+        gsub(/"/, "", n); gsub(/"/, "", t); gsub(/"/, "", m);
+        gsub(/[[:space:]]+/, "", n);
+        gsub(/[[:space:]]+/, "", t);
+        gsub(/[[:space:]]+/, "", m);
+
+        nn=tolower(n); tt=tolower(t); mm=tolower(m);
+
+        # 跳过表头
+        if (nn=="name" && tt=="type") next;
+
+        if (tt=="bridge" && (mm=="yes" || mm=="true" || mm=="1")) {
+          print n
+        }
       }
-    '
+    ' \
+    | sed '/^$/d'
 }
 
-# 选择一个可用的 lxdbrX 名字（避免冲突）
+# 判断网络是否为 managed bridge（基于列表匹配，最稳）
+is_managed_bridge() {
+  local net="$1"
+  net="$(echo "$net" | tr -d '[:space:]' | tr -d '\r')"
+  list_managed_bridges | grep -Fxq "$net"
+}
+
 pick_free_lxdbr_name() {
   local i name
   for i in 0 1 2 3 4 5; do
