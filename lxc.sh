@@ -778,6 +778,243 @@ ipv6_menu() {
     *) warn "无效选项"; pause ;;
   esac
 }
+# ----------------------------
+# IPv4 Port Forward (LXD proxy)
+# ----------------------------
+
+is_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1 <= $1 && $1 <= 65535 )); }
+
+# 解析端口输入： "80" / "80,443" / "8000-8010" / "80,8000-8010"
+# 输出每个端口一行；最多展开 200 个，防止误输入炸裂
+expand_ports() {
+  local spec="${1:-}" part a b out=() cnt=0
+  spec="$(echo "$spec" | tr -d '[:space:]' | tr -d $'\r')"
+  IFS=',' read -r -a parts <<< "$spec"
+  for part in "${parts[@]}"; do
+    [[ -z "$part" ]] && continue
+    if [[ "$part" =~ ^[0-9]+-[0-9]+$ ]]; then
+      a="${part%-*}"; b="${part#*-}"
+      if ! is_port "$a" || ! is_port "$b" || (( a > b )); then return 1; fi
+      while (( a <= b )); do
+        out+=("$a"); cnt=$((cnt+1)); ((cnt>200)) && return 1
+        a=$((a+1))
+      done
+    else
+      if ! is_port "$part"; then return 1; fi
+      out+=("$part"); cnt=$((cnt+1)); ((cnt>200)) && return 1
+    fi
+  done
+  ((${#out[@]}==0)) && return 1
+  printf "%s\n" "${out[@]}"
+}
+
+proxy_dev_exists() {
+  local ct="$1" dev="$2"
+  lxc config device show "$ct" 2>/dev/null | grep -qE "^${dev}:" 
+}
+
+gen_proxy_dev_name() {
+  local proto="$1" hp="$2" cp="$3"
+  # 设备名不能太长，且要唯一
+  local base="px_${proto}_${hp}_${cp}" dev="$base" i=0
+  while proxy_dev_exists "$TARGET_CT" "$dev"; do
+    i=$((i+1))
+    dev="${base}_$i"
+    (( i > 50 )) && { echo ""; return 1; }
+  done
+  echo "$dev"
+}
+
+list_proxy_devices() {
+  local ct="$1"
+  echo -e "${BLUE}当前容器 proxy 端口映射：${NC}"
+  # 从 lxc config device show 的 yaml 里挑出 type=proxy 的设备
+  lxc config device show "$ct" 2>/dev/null | awk '
+    /^[^[:space:]].*:/ {dev=$1; sub(":", "", dev); type=""; listen=""; connect=""; nat=""; next}
+    $1=="type:" {type=$2}
+    $1=="listen:" {listen=$2}
+    $1=="connect:" {connect=$2}
+    $1=="nat:" {nat=$2}
+    # 每遇到新设备或文件结束时打印，需要用 END 兜底
+    END { }
+  ' >/dev/null 2>&1
+
+  # 更稳的做法：直接 grep proxy 段（简洁可读）
+  local out
+  out="$(lxc config device show "$ct" 2>/dev/null \
+    | awk '
+      /^[^[:space:]].*:/ {dev=$1; sub(":", "", dev); type=""; listen=""; connect=""; nat=""; next}
+      $1=="type:" {type=$2}
+      $1=="listen:" {listen=$2}
+      $1=="connect:" {connect=$2}
+      $1=="nat:" {nat=$2}
+      /^$/ {
+        if(type=="proxy") printf("  - %s  listen=%s  connect=%s  nat=%s\n", dev, listen, connect, nat)
+      }
+      END {
+        if(type=="proxy") printf("  - %s  listen=%s  connect=%s  nat=%s\n", dev, listen, connect, nat)
+      }'
+  )"
+  if [[ -z "$out" ]]; then
+    echo "  (无)"
+  else
+    echo "$out"
+  fi
+}
+
+add_proxy_forward() {
+  ensure_lxc || return
+  list_containers || { pause; return; }
+
+  read -r -p "选择容器(名字或编号): " input < /dev/tty
+  input="$(sanitize_input "$input")"
+  local ct=""
+  if ! ct="$(resolve_target "$input")"; then
+    err "编号越界或输入无效。"
+    pause; return
+  fi
+  TARGET_CT="$ct"  # 给 gen_proxy_dev_name 用
+
+  echo -e "${YELLOW}协议：1=TCP  2=UDP  3=TCP+UDP (默认 1)${NC}"
+  read -r -p "选择: " p < /dev/tty
+  p="$(sanitize_input "${p:-}")"
+  local protos=()
+  case "${p:-1}" in
+    1|"") protos=("tcp") ;;
+    2) protos=("udp") ;;
+    3) protos=("tcp" "udp") ;;
+    *) warn "无效选择，默认 TCP"; protos=("tcp") ;;
+  esac
+
+  read -r -p "宿主机监听 IP (默认 0.0.0.0): " lip < /dev/tty
+  lip="$(sanitize_input "${lip:-}")"
+  [[ -z "$lip" ]] && lip="0.0.0.0"
+
+  read -r -p "宿主机端口(支持 80 / 80,443 / 8000-8010): " hps < /dev/tty
+  hps="$(sanitize_input "${hps:-}")"
+  local host_ports
+  if ! host_ports="$(expand_ports "$hps")"; then
+    err "端口格式非法或范围过大（最多展开 200 个）。"
+    pause; return
+  fi
+
+  read -r -p "容器端口(默认同宿主端口；可填单个端口如 8080): " cps < /dev/tty
+  cps="$(sanitize_input "${cps:-}")"
+  local single_cp=""
+  if [[ -n "$cps" ]]; then
+    is_port "$cps" || { err "容器端口非法：$cps"; pause; return; }
+    single_cp="$cps"
+  fi
+
+  read -r -p "容器内连接 IP (默认 127.0.0.1): " cip < /dev/tty
+  cip="$(sanitize_input "${cip:-}")"
+  [[ -z "$cip" ]] && cip="127.0.0.1"
+
+  echo -e "${YELLOW}将创建端口映射：${NC}"
+  echo "  容器: $ct"
+  echo "  监听: ${lip}:[宿主端口...] -> ${cip}:[容器端口]"
+  echo "  协议: ${protos[*]}"
+  read -r -p "确认继续？(y/N): " yn < /dev/tty
+  yn="$(sanitize_input "${yn:-}")"
+  [[ "$yn" != "y" && "$yn" != "Y" ]] && { warn "已取消。"; pause; return; }
+
+  local hp cp proto dev okc=0 failc=0
+  while read -r hp; do
+    cp="${single_cp:-$hp}"
+    for proto in "${protos[@]}"; do
+      dev="$(gen_proxy_dev_name "$proto" "$hp" "$cp")"
+      if [[ -z "$dev" ]]; then
+        warn "设备名生成失败（可能重名太多），跳过：$proto $hp->$cp"
+        failc=$((failc+1))
+        continue
+      fi
+      if lxc config device add "$ct" "$dev" proxy \
+        listen="${proto}:${lip}:${hp}" \
+        connect="${proto}:${cip}:${cp}" \
+        nat=true >/dev/null 2>&1; then
+        okc=$((okc+1))
+      else
+        failc=$((failc+1))
+        warn "创建失败：$dev  (${proto} ${lip}:${hp} -> ${cip}:${cp})"
+      fi
+    done
+  done <<< "$host_ports"
+
+  ok "完成：成功 $okc / 失败 $failc"
+  echo -e "${YELLOW}提示：如果外部仍连不上，检查宿主机防火墙/安全组是否放行该端口。${NC}"
+  pause
+}
+
+del_proxy_forward() {
+  ensure_lxc || return
+  list_containers || { pause; return; }
+
+  read -r -p "选择容器(名字或编号): " input < /dev/tty
+  input="$(sanitize_input "$input")"
+  local ct=""
+  if ! ct="$(resolve_target "$input")"; then
+    err "编号越界或输入无效。"
+    pause; return
+  fi
+
+  list_proxy_devices "$ct"
+  echo
+  read -r -p "输入要删除的 device 名（如 px_tcp_8080_80），或输入 listen 端口（如 8080）: " key < /dev/tty
+  key="$(sanitize_input "${key:-}")"
+  [[ -z "$key" ]] && { err "输入不能为空"; pause; return; }
+
+  local removed=0 dev
+  if [[ "$key" =~ ^[0-9]+$ ]]; then
+    # 按 listen 端口删除（匹配 listen=proto:ip:PORT）
+    for dev in $(lxc config device show "$ct" 2>/dev/null | awk '/^[^[:space:]].*:/ {d=$1; sub(":", "", d)} $1=="listen:"{if($2~":"ENVIRON["P"]"$") print d}' P=":${key}"); do
+      lxc config device remove "$ct" "$dev" >/dev/null 2>&1 && removed=$((removed+1))
+    done
+  else
+    if lxc config device remove "$ct" "$key" >/dev/null 2>&1; then
+      removed=1
+    fi
+  fi
+
+  if (( removed > 0 )); then
+    ok "已删除 $removed 条映射。"
+  else
+    warn "未删除任何映射（可能名称/端口不匹配）。"
+  fi
+  pause
+}
+
+port_forward_menu() {
+  ensure_lxc || return
+  while true; do
+    clear
+    echo -e "${BLUE}====================================${NC}"
+    echo -e "${GREEN}     IPv4 外部访问容器：端口映射     ${NC}"
+    echo -e "${BLUE}====================================${NC}"
+    echo "1) 添加端口映射（TCP/UDP/双协议，支持范围）"
+    echo "2) 查看某容器已有映射"
+    echo "3) 删除端口映射（按 device 名或 listen 端口）"
+    echo "0) 返回"
+    echo "------------------------------------"
+    read -r -p "请选择: " op < /dev/tty
+    op="$(sanitize_input "${op:-}")"
+
+    case "$op" in
+      1) add_proxy_forward ;;
+      2)
+        list_containers || { pause; continue; }
+        read -r -p "选择容器(名字或编号): " input < /dev/tty
+        input="$(sanitize_input "$input")"
+        local ct=""
+        if ! ct="$(resolve_target "$input")"; then err "无效"; pause; continue; fi
+        list_proxy_devices "$ct"
+        pause
+        ;;
+      3) del_proxy_forward ;;
+      0) return ;;
+      *) warn "无效选项"; pause ;;
+    esac
+  done
+}
 
 detect_lxd_install_method() {
   # echo: snap | apt | unknown
@@ -999,6 +1236,7 @@ main_menu() {
     echo -e "7. 🗑️  销毁指定容器"
     echo -e "8. 🔄  从 GitHub 更新脚本"
     echo -e "9. ❌  彻底卸载环境  ${YELLOW}"
+    echo -e "10. 🔀  外部 IPv4 访问容器（端口映射）"
     echo -e "0. 退出脚本"
     echo -e "${BLUE}------------------------------------${NC}"
 
@@ -1015,6 +1253,7 @@ main_menu() {
       7) delete_container ;;
       8) update_script ;;
       9) uninstall_env ;;
+      10) port_forward_menu ;;
       0) exit 0 ;;
       *) warn "无效选项：$opt"; pause ;;
     esac
