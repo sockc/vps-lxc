@@ -600,32 +600,124 @@ detect_lxd_bridge_net() {
 
   return 1
 }
+# 判断网络是否存在
+net_exists() { lxc network show "$1" >/dev/null 2>&1; }
+
+# 判断网络是否为 managed bridge（MANAGED=YES 且 TYPE=bridge）
+is_managed_bridge() {
+  local net="$1"
+  lxc network list -c n,t,m --format csv 2>/dev/null \
+    | tr -d '\r' \
+    | awk -F',' -v N="$net" '$1==N {print tolower($2)","tolower($3)}' \
+    | grep -q '^bridge,yes$'
+}
+
+# 列出所有 managed bridge 名称
+list_managed_bridges() {
+  lxc network list -c n,t,m --format csv 2>/dev/null \
+    | tr -d '\r' \
+    | awk -F',' 'tolower($2)=="bridge" && tolower($3)=="yes" {print $1}'
+}
+
+# 选择一个可用的 lxdbrX 名字（避免冲突）
+pick_free_lxdbr_name() {
+  local i name
+  for i in 0 1 2 3 4 5; do
+    name="lxdbr${i}"
+    net_exists "$name" || { echo "$name"; return 0; }
+  done
+  echo "lxdbr0"
+}
+
+# 创建 managed bridge（IPv4/IPv6 NAT 都开，IPv6 用 ULA + NAT66）
+create_managed_bridge() {
+  local name="$1"
+  lxc network create "$name" \
+    ipv4.address=auto ipv4.nat=true \
+    ipv6.address=auto ipv6.nat=true ipv6.firewall=true
+}
 
 # ---- IPv6 menu ----
 ipv6_menu() {
   ensure_lxc || return
 
   local net="${LXD_BR_NET:-}"
-  if [[ -z "$net" ]]; then
-    net="$(detect_lxd_bridge_net 2>/dev/null || true)"
-  fi
 
-  if [[ -z "$net" ]] || ! net_exists "$net"; then
-    err "未找到可用的 LXD bridge 网络（所以才会 Network not found）"
+  # 1) 如果系统里压根没有 managed bridge，直接提供一键创建
+  local managed_list
+  managed_list="$(list_managed_bridges || true)"
+
+  if [[ -z "${managed_list:-}" ]]; then
+    warn "当前没有 MANAGED=YES 的 LXD bridge 网络。"
+    warn "你的网络列表里那些 br-xxxx/docker0/enp0s6 都是 MANAGED=NO（外部网桥），无法使用 ipv6.nat/ipv6.address 等 LXD 网络参数。"
+    echo
     echo -e "${YELLOW}当前网络列表：${NC}"
     lxc network list || true
     echo
-    read -r -p "请输入要管理的网络名（例如 lxdbr0 / lxdbr1 / 你列表里的名字）: " net < /dev/tty
-    net="$(sanitize_input "${net:-}")"
-    if [[ -z "$net" ]] || ! net_exists "$net"; then
-      err "网络名无效或不存在：$net"
+
+    local def_name
+    def_name="$(pick_free_lxdbr_name)"
+    read -r -p "是否创建一个 LXD 管理网桥用于容器 IPv6 出站？(y/N): " yn < /dev/tty
+    yn="$(sanitize_input "${yn:-}")"
+    if [[ "$yn" != "y" && "$yn" != "Y" ]]; then
+      warn "已取消。"
       pause
       return
     fi
+
+    read -r -p "网桥名称 (默认: ${def_name}): " net_in < /dev/tty
+    net_in="$(sanitize_input "${net_in:-}")"
+    [[ -z "$net_in" ]] && net_in="$def_name"
+
+    if net_exists "$net_in"; then
+      if is_managed_bridge "$net_in"; then
+        ok "已存在 managed bridge：$net_in"
+      else
+        err "网络名 $net_in 已存在，但它是 MANAGED=NO（不可用于本功能）。"
+        warn "请换一个名字（例如：$(pick_free_lxdbr_name)）"
+        pause
+        return
+      fi
+    else
+      info "创建 managed bridge：$net_in（IPv4/IPv6 NAT）..."
+      if create_managed_bridge "$net_in"; then
+        ok "已创建：$net_in（MANAGED=YES）"
+      else
+        err "创建失败：$net_in"
+        echo -e "${YELLOW}建议：${NC} lxc network create $net_in ... 以及检查 LXD 状态"
+        pause
+        return
+      fi
+    fi
+
+    net="$net_in"
+    LXD_BR_NET="$net"
+    managed_list="$net"
   fi
 
-  LXD_BR_NET="$net"
+  # 2) 如果已有 managed bridge，但当前 net 未设置或无效，就让用户选择（只允许 managed）
+  if [[ -z "${net:-}" ]] || ! net_exists "$net" || ! is_managed_bridge "$net"; then
+    echo -e "${BLUE}可用的 MANAGED bridge 网络：${NC}"
+    echo "$managed_list" | nl -w2 -s') '
+    read -r -p "请选择网络（输入编号或直接输入名字，默认 1）: " pick < /dev/tty
+    pick="$(sanitize_input "${pick:-}")"
+    if [[ -z "$pick" ]]; then
+      net="$(echo "$managed_list" | sed -n '1p')"
+    elif [[ "$pick" =~ ^[0-9]+$ ]]; then
+      net="$(echo "$managed_list" | sed -n "${pick}p")"
+    else
+      net="$pick"
+    fi
 
+    if [[ -z "${net:-}" ]] || ! net_exists "$net" || ! is_managed_bridge "$net"; then
+      err "选择无效：$net（必须是 MANAGED=YES 且 TYPE=bridge）"
+      pause
+      return
+    fi
+    LXD_BR_NET="$net"
+  fi
+
+  # 3) 显示当前配置
   local addr nat fw
   addr="$(lxc network get "$net" ipv6.address 2>/dev/null || echo "<unset>")"
   nat="$(lxc network get "$net" ipv6.nat 2>/dev/null || echo "<unset>")"
@@ -686,6 +778,7 @@ ipv6_menu() {
     *) warn "无效选项"; pause ;;
   esac
 }
+
 detect_lxd_install_method() {
   # echo: snap | apt | unknown
   if command -v snap >/dev/null 2>&1 && snap list 2>/dev/null | awk '{print $1}' | grep -qx lxd; then
