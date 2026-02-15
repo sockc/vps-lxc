@@ -850,7 +850,6 @@ choose_managed_bridge_interactive() {
     return 1
   fi
 
-  # 注意：菜单输出到 /dev/tty，避免被命令替换捕获
   {
     echo -e "${BLUE}可用的 MANAGED bridge 网络：${NC}"
     echo "$list" | nl -w2 -s') '
@@ -872,7 +871,6 @@ choose_managed_bridge_interactive() {
     return 1
   fi
 
-  # 只把最终结果输出到 stdout
   printf '%s\n' "$net"
 }
 
@@ -1444,6 +1442,105 @@ uninstall_env() {
   pause
 }
 
+default_profile_has_nic() {
+  lxc profile show default 2>/dev/null \
+    | awk '
+      $1=="devices:" {in=1; next}
+      in && /^[^[:space:]]/ {in=0}
+      in && /^[[:space:]]+type:/ && $2=="nic" {found=1}
+      END { exit(found?0:1) }
+    '
+}
+
+show_default_profile_devices() {
+  echo -e "${BLUE}default profile 当前 devices：${NC}" > /dev/tty
+  lxc profile show default 2>/dev/null | awk '
+    $1=="devices:" {print; in=1; next}
+    in {print}
+  ' > /dev/tty
+}
+
+startup_sanity_check() {
+  ensure_lxc || return 0
+
+  # 1) 检查 managed bridge 是否存在
+  local bridges
+  bridges="$(list_managed_bridges 2>/dev/null || true)"
+
+  # 2) 检查 default profile 是否有 nic
+  if default_profile_has_nic; then
+    return 0
+  fi
+
+  # 没有 nic：给出提示
+  {
+    echo -e "${YELLOW}[WARN] default profile 缺少网卡（nic）。新建容器将只有 lo，无法联网。${NC}"
+    show_default_profile_devices
+  } > /dev/tty
+
+  if [[ -z "${bridges:-}" ]]; then
+    {
+      echo -e "${RED}[ERR ] 当前没有可用的 MANAGED bridge（lxdbr0/lxdbr1）。${NC}"
+      echo -e "${YELLOW}建议：先在菜单里创建 managed bridge（lxdbr0），再回来修复 default profile。${NC}"
+      echo
+      lxc network list || true
+      echo
+      read -r -p "按回车继续进入菜单..." < /dev/tty
+    } > /dev/tty
+    return 0
+  fi
+
+  # 询问是否自动修复
+  {
+    echo -e "${GREEN}可一键修复：为 default profile 添加 eth0 网卡（接入 managed bridge）。${NC}"
+    echo -e "${BLUE}可用的 managed bridge：${NC}"
+    echo "$bridges" | nl -w2 -s') '
+  } > /dev/tty
+
+  local pick net yn
+  read -r -p "选择网络（输入编号或名字，默认 1）: " pick < /dev/tty
+  pick="$(sanitize_input "${pick:-}")"
+  if [[ -z "$pick" ]]; then
+    net="$(echo "$bridges" | sed -n '1p')"
+  elif [[ "$pick" =~ ^[0-9]+$ ]]; then
+    net="$(echo "$bridges" | sed -n "${pick}p")"
+  else
+    net="$pick"
+  fi
+  net="$(sanitize_input "${net:-}")"
+
+  if [[ -z "$net" ]] || ! net_exists "$net" || ! is_managed_bridge "$net"; then
+    {
+      echo -e "${RED}[ERR ] 选择无效：$net（必须是 MANAGED bridge）${NC}"
+      read -r -p "按回车继续进入菜单..." < /dev/tty
+    } > /dev/tty
+    return 0
+  fi
+
+  read -r -p "是否立即修复 default profile（添加 eth0 -> $net）？(y/N): " yn < /dev/tty
+  yn="$(sanitize_input "${yn:-}")"
+  if [[ "$yn" != "y" && "$yn" != "Y" ]]; then
+    return 0
+  fi
+
+  # 执行修复：如果 eth0 已存在就 set，否则 add
+  if lxc profile device list default 2>/dev/null | grep -qx eth0; then
+    lxc profile device set default eth0 network "$net" >/dev/null 2>&1 || true
+    lxc profile device set default eth0 name eth0 >/dev/null 2>&1 || true
+  else
+    lxc profile device add default eth0 nic network="$net" name=eth0 >/dev/null 2>&1 || true
+  fi
+
+  if default_profile_has_nic; then
+    echo -e "${GREEN}[ OK ] 已修复 default profile：新建容器将默认拥有网卡。${NC}" > /dev/tty
+  else
+    echo -e "${RED}[ERR ] 修复失败：请检查 profile 权限/配置。${NC}" > /dev/tty
+    echo -e "${YELLOW}建议：${NC} lxc profile show default" > /dev/tty
+  fi
+
+  read -r -p "按回车继续进入菜单..." < /dev/tty
+}
+
 # ---- Main menu ----
 main_menu() {
   while true; do
@@ -1487,5 +1584,6 @@ main_menu() {
   done
 }
 
-need_root
+[[ $EUID -ne 0 ]] && echo "请用 root 运行" && exit 1
+startup_sanity_check
 main_menu
