@@ -146,6 +146,16 @@ enter_container() {
   ensure_lxc || return
   list_containers || { sleep 1; return; }
 
+  lxc_exec_tty() {
+  local ct="$1"; shift
+  # 如果脚本 stdin/stdout 不是 TTY（管道/进程替换执行），强制绑到 /dev/tty
+  if [[ -t 0 && -t 1 ]]; then
+    lxc exec "$ct" -- "$@"
+  else
+    lxc exec "$ct" -- "$@" < /dev/tty > /dev/tty 2>&1
+  fi
+}
+
   echo -e "${YELLOW}提示: 直接输入容器名字最稳；也可输入编号（从 1 开始）${NC}"
   read -r -p "请输入名字或编号: " input < /dev/tty
   input="$(sanitize_input "$input")"
@@ -188,9 +198,12 @@ enter_container() {
   ok "正在连接 $target ...（退出后会回到菜单）"
 
   # 更通用：明确 shell 路径
-  if ! lxc exec "$target" -- /bin/bash; then
-    warn "/bin/bash 不可用，尝试 /bin/sh ..."
-    if ! lxc exec "$target" -- /bin/sh; then
+if ! lxc_exec_tty "$target" /bin/bash -li; then
+  echo -e "${YELLOW}⚠️  /bin/bash 不可用，尝试 /bin/sh 进入...${NC}"
+  if ! lxc_exec_tty "$target" /bin/sh -l; then
+    ...
+  fi
+fi
       err "------------------------------------"
       err "致命错误: 无法进入容器 '$target'"
       echo -e "${YELLOW}可能原因:${NC}"
