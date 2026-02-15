@@ -843,15 +843,22 @@ container_has_nic() {
 
 choose_managed_bridge_interactive() {
   local list net pick
+
   list="$(list_managed_bridges 2>/dev/null || true)"
   if [[ -z "${list:-}" ]]; then
-    err "没有可用的 MANAGED bridge（请先在 IPv6 菜单创建 lxdbr0/lxdbr1）"
+    err "没有可用的 MANAGED bridge（请先创建 lxdbr0/lxdbr1）"
     return 1
   fi
-  echo -e "${BLUE}可用的 MANAGED bridge 网络：${NC}"
-  echo "$list" | nl -w2 -s') '
+
+  # 注意：菜单输出到 /dev/tty，避免被命令替换捕获
+  {
+    echo -e "${BLUE}可用的 MANAGED bridge 网络：${NC}"
+    echo "$list" | nl -w2 -s') '
+  } > /dev/tty
+
   read -r -p "请选择网络（输入编号或直接输入名字，默认 1）: " pick < /dev/tty
   pick="$(sanitize_input "${pick:-}")"
+
   if [[ -z "$pick" ]]; then
     net="$(echo "$list" | sed -n '1p')"
   elif [[ "$pick" =~ ^[0-9]+$ ]]; then
@@ -859,9 +866,14 @@ choose_managed_bridge_interactive() {
   else
     net="$pick"
   fi
-  [[ -z "${net:-}" ]] && return 1
-  net_exists "$net" && is_managed_bridge "$net" || return 1
-  echo "$net"
+
+  net="$(sanitize_input "${net:-}")"
+  if [[ -z "$net" ]] || ! net_exists "$net" || ! is_managed_bridge "$net"; then
+    return 1
+  fi
+
+  # 只把最终结果输出到 stdout
+  printf '%s\n' "$net"
 }
 
 fix_container_nic() {
