@@ -216,23 +216,152 @@ if ! lxc_exec_tty "$target" /bin/bash -li; then
     fi
   fi
 }
+# --- 从 images: 取别名，过滤只要 CONTAINER ---
+_image_aliases_container_only() {
+  local distro="$1"
+  # 输出：alias,type
+  lxc image list images: "$distro" -c l,t --format csv 2>/dev/null \
+    | tr -d '\r' \
+    | awk -F',' '$2=="CONTAINER"{print $1}'
+}
+
+# --- Ubuntu 版本列表（只取 ubuntu/YY.MM）---
+get_ubuntu_versions() {
+  _image_aliases_container_only ubuntu \
+    | grep -E '^ubuntu/[0-9]{2}\.[0-9]{2}$' \
+    | sed 's#^ubuntu/##' \
+    | sort -V
+}
+
+# --- Debian 版本列表（只取 debian/数字）---
+get_debian_versions() {
+  _image_aliases_container_only debian \
+    | grep -E '^debian/[0-9]+$' \
+    | sed 's#^debian/##' \
+    | sort -V
+}
+
+# --- Alpine 版本列表（只取 alpine/X.Y）---
+get_alpine_versions() {
+  _image_aliases_container_only alpine \
+    | grep -E '^alpine/[0-9]+\.[0-9]+$' \
+    | sed 's#^alpine/##' \
+    | sort -V
+}
+
+# --- 通用：从版本列表里让用户选（编号或直接输入版本号）---
+_select_version_from_list() {
+  local title="$1" versions="$2" default_ver="$3"
+  local v picked
+
+  echo -e "${BLUE}${title}${NC}"
+  echo "$versions" | tail -n 10 | nl -w2 -s') '
+
+  echo -e "${YELLOW}直接回车 = 默认 ${default_ver}${NC}"
+  read -r -p "选择版本(输入编号或直接输入版本号): " v < /dev/tty
+  v="$(sanitize_input "${v:-}")"
+
+  if [[ -z "$v" ]]; then
+    v="$default_ver"
+  elif [[ "$v" =~ ^[0-9]+$ ]]; then
+    picked="$(echo "$versions" | tail -n 10 | sed -n "${v}p")"
+    [[ -n "$picked" ]] && v="$picked"
+  fi
+
+  echo "$v"
+}
+
+# --- 通用：default / cloud 变体选择 ---
+_select_variant() {
+  local variant
+  read -r -p "变体：1=default  2=cloud (默认 1): " variant < /dev/tty
+  variant="$(sanitize_input "${variant:-}")"
+  [[ "$variant" == "2" ]] && echo "cloud" || echo "default"
+}
+
+# --- Ubuntu 动态选择：默认选“最新 LTS（*.04）”，否则选最新 ---
+select_ubuntu_image() {
+  local versions latest latest_lts ver variant
+
+  versions="$(get_ubuntu_versions || true)"
+  latest="$(echo "$versions" | tail -n 1)"
+  latest_lts="$(echo "$versions" | grep -E '\.04$' | tail -n 1)"
+
+  if [[ -z "${latest:-}" ]]; then
+    # 远程不可用时兜底（你也可以改成提示用户自定义输入）
+    echo "images:ubuntu/24.04"
+    return 0
+  fi
+
+  # 默认：优先 LTS
+  ver="${latest_lts:-$latest}"
+  echo -e "${YELLOW}提示: Ubuntu 默认优先选择最新 LTS（*.04）。最新版本=${latest}，最新 LTS=${ver}${NC}"
+  ver="$(_select_version_from_list "可用 Ubuntu 版本（CONTAINER）:" "$versions" "$ver")"
+
+  variant="$(_select_variant)"
+  if [[ "$variant" == "cloud" ]]; then
+    echo "images:ubuntu/${ver}/cloud"
+  else
+    echo "images:ubuntu/${ver}"
+  fi
+}
+
+# --- Debian 动态选择：默认选最新数字版 ---
+select_debian_image() {
+  local versions latest ver variant
+
+  versions="$(get_debian_versions || true)"
+  latest="$(echo "$versions" | tail -n 1)"
+  if [[ -z "${latest:-}" ]]; then
+    echo "images:debian/12"
+    return 0
+  fi
+
+  ver="$(_select_version_from_list "可用 Debian 版本（CONTAINER）:" "$versions" "$latest")"
+  variant="$(_select_variant)"
+  if [[ "$variant" == "cloud" ]]; then
+    echo "images:debian/${ver}/cloud"
+  else
+    echo "images:debian/${ver}"
+  fi
+}
+
+# --- Alpine 动态选择：默认选最新 X.Y ---
+select_alpine_image() {
+  local versions latest ver variant
+
+  versions="$(get_alpine_versions || true)"
+  latest="$(echo "$versions" | tail -n 1)"
+  if [[ -z "${latest:-}" ]]; then
+    echo "images:alpine/edge"
+    return 0
+  fi
+
+  ver="$(_select_version_from_list "可用 Alpine 版本（CONTAINER）:" "$versions" "$latest")"
+  variant="$(_select_variant)"
+  if [[ "$variant" == "cloud" ]]; then
+    echo "images:alpine/${ver}/cloud"
+  else
+    echo "images:alpine/${ver}"
+  fi
+}
 
 # ---- Create container (基础可用版) ----
 create_container() {
   ensure_lxc || return
 
   echo -e "${BLUE}常用镜像示例:${NC}"
-  echo "  1) images:ubuntu/24.04"
-  echo "  2) images:debian/12"
-  echo "  3) images:alpine/3.19"
+  echo "  1) images:ubuntu (动态版本)"
+  echo "  2) images:debian (动态版本)"
+  echo "  3) images:alpine (动态版本)"
   echo "  4) 自定义输入"
   read -r -p "选择镜像 [1-4] (默认 1): " ch < /dev/tty
   ch="$(sanitize_input "${ch:-}")"
   local image="images:ubuntu/24.04"
   case "${ch:-1}" in
-    1|"") image="images:ubuntu/24.04" ;;
-    2) image="images:debian/12" ;;
-    3) image="images:alpine/3.19" ;;
+    1|"") image="$(select_ubuntu_image)" ;;
+    2) image="$(select_debian_image)" ;;
+    3) image="$(select_alpine_image)" ;;
     4)
       read -r -p "请输入镜像别名（如 images:ubuntu/22.04）: " image < /dev/tty
       image="$(sanitize_input "$image")"
