@@ -1443,19 +1443,22 @@ uninstall_env() {
 default_profile_has_nic() {
   lxc profile show default 2>/dev/null \
     | awk '
-      $1=="devices:" {in=1; next}
-      in && /^[^[:space:]]/ {in=0}
-      in && /^[[:space:]]+type:/ && $2=="nic" {found=1}
+      $1=="devices:" {inside=1; next}
+      inside && /^[^[:space:]]/ {inside=0}
+      inside && $1=="type:" && $2=="nic" {found=1}
       END { exit(found?0:1) }
     '
 }
 
 show_default_profile_devices() {
-  echo -e "${BLUE}default profile 当前 devices：${NC}" > /dev/tty
-  lxc profile show default 2>/dev/null | awk '
-    $1=="devices:" {print; in=1; next}
-    in {print}
-  ' > /dev/tty
+  {
+    echo -e "${BLUE}default profile 当前 devices：${NC}"
+    lxc profile show default 2>/dev/null | awk '
+      $1=="devices:" {print; inside=1; next}
+      inside && /^[^[:space:]]/ {exit}
+      inside {print}
+    '
+  } > /dev/tty
 }
 
 startup_sanity_check() {
