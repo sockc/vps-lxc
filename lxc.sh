@@ -609,29 +609,26 @@ is_managed_bridge() {
   lxc network list -c n,t,m --format csv 2>/dev/null \
     | tr -d '\r' \
     | awk -F',' -v N="$net" '
-        $1==N {
-          t=tolower($2); m=tolower($3);
-          gsub(/[[:space:]]+/, "", t);
-          gsub(/[[:space:]]+/, "", m);
-          if (t=="bridge" && (m=="yes" || m=="true" || m=="1")) exit 0;
-          exit 1
-        }
-        END { exit 1 }
-      '
+      $1==N {
+        t=tolower($2); m=tolower($3);
+        gsub(/[[:space:]]+/, "", t); gsub(/[[:space:]]+/, "", m);
+        if (t=="bridge" && (m=="yes" || m=="true" || m=="1")) exit 0;
+        exit 1
+      }
+      END { exit 1 }
+    '
 }
 
-# 列出所有 managed bridge 名称（兼容 YES/true/1）
 list_managed_bridges() {
   lxc network list -c n,t,m --format csv 2>/dev/null \
     | tr -d '\r' \
     | awk -F',' '
-        {
-          t=tolower($2); m=tolower($3);
-          gsub(/[[:space:]]+/, "", t);
-          gsub(/[[:space:]]+/, "", m);
-          if (t=="bridge" && (m=="yes" || m=="true" || m=="1")) print $1
-        }
-      '
+      {
+        t=tolower($2); m=tolower($3);
+        gsub(/[[:space:]]+/, "", t); gsub(/[[:space:]]+/, "", m);
+        if (t=="bridge" && (m=="yes" || m=="true" || m=="1")) print $1
+      }
+    '
 }
 
 # 选择一个可用的 lxdbrX 名字（避免冲突）
