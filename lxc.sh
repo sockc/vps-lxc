@@ -216,13 +216,57 @@ if ! lxc_exec_tty "$target" /bin/bash -li; then
     fi
   fi
 }
+detect_host_lxd_arch() {
+  # uname -m -> LXD images server 常见架构名
+  local m
+  m="$(uname -m 2>/dev/null || echo unknown)"
+  case "$m" in
+    x86_64|amd64) echo "x86_64" ;;
+    aarch64|arm64) echo "aarch64" ;;
+    armv7l|armv7*) echo "armv7l" ;;
+    armv6l|armv6*) echo "armv6l" ;;
+    i386|i686) echo "i686" ;;
+    ppc64le) echo "ppc64le" ;;
+    s390x) echo "s390x" ;;
+    riscv64) echo "riscv64" ;;
+    *) echo "$m" ;;
+  esac
+}
+
+HOST_LXD_ARCH="$(detect_host_lxd_arch)"
+
 # --- 从 images: 取别名，过滤只要 CONTAINER ---
 _image_aliases_container_only() {
   local distro="$1"
-  # 输出：alias,type
-  lxc image list images: "$distro" -c l,t --format csv 2>/dev/null \
-    | tr -d '\r' \
-    | awk -F',' '$2=="CONTAINER"{print $1}'
+  local arch="${2:-$HOST_LXD_ARCH}"
+  local all generic
+
+  # 优先走：alias,arch,type（三列）
+  all="$(
+    lxc image list images: "$distro" -c l,a,t --format csv 2>/dev/null \
+      | tr -d '\r' \
+      | awk -F',' -v A="$arch" '$3=="CONTAINER" && $2==A {print $1}'
+  )"
+
+  # 如果当前 lxc 不支持 -c a（极少数老版本），回退到旧逻辑
+  if [[ -z "${all:-}" ]]; then
+    all="$(
+      lxc image list images: "$distro" -c l,t --format csv 2>/dev/null \
+        | tr -d '\r' \
+        | awk -F',' '$2=="CONTAINER"{print $1}'
+    )"
+  fi
+
+  # 优先保留“通用别名”（不带 /amd64 /aarch64 这种后缀），方便后续拼 /cloud
+  generic="$(
+    echo "$all" | grep -Ev '/(amd64|arm64|aarch64|x86_64|i686|armv7l|armv6l|riscv64|ppc64le|s390x)$' || true
+  )"
+
+  if [[ -n "${generic:-}" ]]; then
+    echo "$generic"
+  else
+    echo "$all"
+  fi
 }
 
 # --- Ubuntu 版本列表（只取 ubuntu/YY.MM）---
@@ -349,6 +393,7 @@ select_alpine_image() {
 # ---- Create container (基础可用版) ----
 create_container() {
   ensure_lxc || return
+  echo -e "${YELLOW}当前镜像架构过滤：${HOST_LXD_ARCH}${NC}"
 
   echo -e "${BLUE}常用镜像示例:${NC}"
   echo "  1) images:ubuntu (动态版本)"
