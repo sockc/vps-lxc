@@ -476,7 +476,7 @@ main_menu() {
   while true; do
     clear
     echo -e "${BLUE}====================================${NC}"
-    echo -e "${GREEN}      sockc LXC 极客面板 v5.1       ${NC}"
+    echo -e "${GREEN}      sockc LXC 极客面板 v5.2       ${NC}"
     echo -e "${BLUE}====================================${NC}"
     echo -e "1. 🏗️  创建新容器"
     echo -e "2. 📸  快照备份 / 一键回滚"
